@@ -45,6 +45,9 @@ JOINTS = ["shoulder_pan", "shoulder_lift", "elbow", "wrist_1", "wrist_2", "wrist
 GRIPPER_TCP = 0.151    # m from flange: 1 mm short of the fingertips (Figure 5: 152 mm)
 # Fingers close on the PCB's top and bottom faces (1.6 mm gap when closed).
 IRON_TCP = 0.280       # m from flange: solder tip (Figure 4)
+CAM_FOVY = 38.0        # deg, vertical field of view of the overhead camera
+CAM_LENS_DROP = 0.05   # m, lens below the camera housing
+FIDUCIAL = (33.0, 18.0, 4.0)   # mm: white mark on the PCB (u, v, half size)
 # Header pads on the PCB, in the PCB frame (u along 85 mm, v along 55 mm), mm
 PADS = [(-30.0, v) for v in (-3.81, -1.27, 1.27, 3.81)]
 
@@ -64,7 +67,7 @@ def _workcell_spec():
     s = mujoco.MjSpec()
     s.option.timestep = 0.001
     s.option.integrator = mujoco.mjtIntegrator.mjINT_IMPLICITFAST
-    s.visual.global_.offwidth, s.visual.global_.offheight = 1600, 900
+    s.visual.global_.offwidth, s.visual.global_.offheight = 1920, 1080
     s.visual.headlight.ambient = [0.35, 0.35, 0.35]
     s.visual.headlight.diffuse = [0.5, 0.5, 0.5]
     s.visual.quality.shadowsize = 4096
@@ -124,7 +127,10 @@ def _workcell_spec():
         [sh["x"] * MM, sh["y"] * MM, sh["height"] * MM / 2], [1.0, 0.85, 0.1, 0.30])
     cx, cy, cz = (v * MM for v in L["camera"])
     box("camera_box", [0.06, 0.06, 0.04], [cx, cy, cz], [0.95, 0.95, 0.95, 1])
-    w.add_camera(name="overhead", pos=[cx, cy, cz - 0.05], xyaxes=[0, -1, 0, 1, 0, 0], fovy=60)
+    # Overhead RGB-D camera (lens 0.05 m below the housing). Image right = +Y,
+    # image down = +X, i.e. the same view as the brief's Figure 2.
+    w.add_camera(name="overhead", pos=[cx, cy, cz - CAM_LENS_DROP], xyaxes=[0, 1, 0, -1, 0, 0],
+                 fovy=CAM_FOVY)
 
     # PCB (mocap: carried kinematically while gripped) with header pads
     pl, pw, pt = (v * MM for v in L["pcb"])
@@ -132,6 +138,10 @@ def _workcell_spec():
     pcb = w.add_body(name="pcb", mocap=True, pos=[x3, y3, hz + pt / 2],
                      quat=_quat_z(np.pi / 2))      # at Pos3 the 85 mm side runs along Y
     box("pcb", [pl / 2, pw / 2, pt / 2], [0, 0, 0], [0.05, 0.25, 0.55, 1], body=pcb)
+    fu, fv, fh = (v * MM for v in FIDUCIAL)       # breaks the board's 180 deg symmetry
+    pcb.add_geom(name="fiducial", type=mujoco.mjtGeom.mjGEOM_BOX, size=[fh, fh, 0.0002],
+                 pos=[fu, fv, pt / 2 + 0.0002], rgba=[0.97, 0.97, 0.97, 1],
+                 contype=0, conaffinity=0)
     for i, (u, v) in enumerate(PADS):
         pcb.add_geom(name=f"pad{i + 1}", type=mujoco.mjtGeom.mjGEOM_CYLINDER,
                      size=[0.0011, 0.0003, 0], pos=[u * MM, v * MM, pt / 2 + 0.0003],
@@ -146,7 +156,7 @@ def _workcell_spec():
                   rgba=[0.87, 0.67, 0.55, 1], contype=0, conaffinity=0)
     hand.add_geom(name="forearm", type=mujoco.mjtGeom.mjGEOM_CAPSULE,
                   fromto=[-0.05, 0, 0.005, -0.32, 0, 0.03], size=[0.035, 0, 0],
-                  rgba=[0.25, 0.35, 0.55, 1], contype=0, conaffinity=0)
+                  rgba=[1.0, 0.42, 0.05, 1], contype=0, conaffinity=0)   # hi-vis sleeve
     return s
 
 

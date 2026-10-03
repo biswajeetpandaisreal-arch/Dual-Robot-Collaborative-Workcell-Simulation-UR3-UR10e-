@@ -32,6 +32,7 @@ import mujoco
 import numpy as np
 
 from build_scene import build_model
+import vision as V
 from planner import DT_PLAN, HOME_UR, Robot, plan_ur10e, plan_ur3
 
 GAINS = {   # outer-loop gains (acceleration units); "matlab" = cfg_partC.m
@@ -40,7 +41,12 @@ GAINS = {   # outer-loop gains (acceleration units); "matlab" = cfg_partC.m
 }
 INT_LIMIT = 1.0
 FINGER_OPEN, FINGER_CLOSED = 0.012, 0.0
-SSM_STOP, SSM_SLOW = 0.25, 0.40       # m: speed and separation monitoring
+SSM_STOP, SSM_SLOW = 0.25, 0.50       # m: speed and separation monitoring
+SSM_RAMP = 0.05                       # speed-scale change per 10 ms tick (0.2 s stop)
+# ISO/TS 15066-style allowance for the camera: measured worst-case distance
+# over-estimate (81 mm, partial occlusion of the hand) plus one 50 ms frame of
+# hand motion, subtracted from the camera's distance before applying SSM.
+VISION_MARGIN = 0.10
 SOLDER_TOL = 0.001                    # m: tip must be within 1 mm of a pad
 
 
@@ -165,7 +171,10 @@ def _seg_time(plan, label, frac):
 
 
 def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
-        speed=1.0, view=False, log_every=10, frame_cb=None, quiet=False):
+        speed=1.0, view=False, log_every=10, frame_cb=None, quiet=False, vision=True):
+    """vision=True: the UR10e is planned from the overhead camera's PCB estimate
+    and speed and separation monitoring uses the camera's person detection.
+    vision=False: both use simulator ground truth."""
     m = build_model()
     d = mujoco.MjData(m)
     dt = m.opt.timestep
@@ -190,11 +199,15 @@ def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
 
     push3_t = _seg_time(plan3, "carry PCB", 0.45)
     push10_t = human_t0 = start10 = end_t = None
-    grasp, prev_tool3, s10, hand_d = None, 0.0, 1.0, np.nan
+    grasp, prev_tool3, s10, hand_d, hand_true = None, 0.0, 1.0, np.nan, np.nan
+    s_target = 1.0
+    ov = V.Overhead(m) if vision else None
+    vis = dict(ov=ov, pcb=None, pcb_true=None, rgb=None, mask=None, dist=np.inf, t_frame=-1)
+    CAM_EVERY = 50                         # ms: 20 Hz camera (multiple of the 10 ms SSM tick)
     closest = np.full(4, np.inf)
     ref_data = mujoco.MjData(m)
     log = {k: [] for k in ("t", "q", "q_ref", "tau", "tcp", "tcp_ref", "w", "hand_d",
-                           "s10", "clear", "push3", "push10")}
+                           "hand_true", "s10", "clear", "push3", "push10")}
     viewer = None
     if view:
         from mujoco import viewer as mj_viewer
@@ -209,7 +222,16 @@ def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
         if ref10 is None and lab3 == "return home":
             # UR3 has released the PCB and withdrawn: measure the PCB, plan UR10e
             start10 = t
-            plan10 = plan_ur10e(m, d.mocap_pos[pcb].copy(), d.mocap_quat[pcb].copy(), speed)
+            true_pose = (d.mocap_pos[pcb].copy(), d.mocap_quat[pcb].copy())
+            vis["pcb_true"] = true_pose
+            if vision:
+                est, vis["rgb_full"] = ov.measure_pcb(d)
+                if est is None:
+                    raise RuntimeError("overhead camera could not find the PCB")
+                vis["pcb"] = est
+                plan10 = plan_ur10e(m, est["pos"], est["quat"], speed)
+            else:
+                plan10 = plan_ur10e(m, *true_pose, speed)
             ref10 = Reference(plan10)
             push10_t = _seg_time(plan10, "to pad 3", 0.5)
             human_t0 = start10 + _seg_time(plan10, "solder pad 2", 0.2) - HAND_OUT
@@ -219,14 +241,19 @@ def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
             q_ref[6:], qd10, qdd10, tool10_cmd, lab10 = ref10.sample()
             qd_ref[6:], qdd_ref[6:] = s10 * qd10, s10**2 * qdd10
 
-        # ── operator's hand + speed and separation monitoring (every 10 ms) ──
+        # ── operator's hand + speed and separation monitoring ──
         if human and human_t0 is not None:
             d.mocap_pos[hand], d.mocap_quat[hand] = _hand_path(t, human_t0)
-            if t >= human_t0 and k % 10 == 0:
-                mujoco.mj_kinematics(m, d)
-                hand_d = _min_dist(m, d, g_hand, g10)
-                s_target = float(np.clip((hand_d - SSM_STOP) / (SSM_SLOW - SSM_STOP), 0, 1))
-                s10 += float(np.clip(s_target - s10, -0.025, 0.025))   # <= 2.5 /s ramp
+        if ref10 is not None and k % 10 == 0:
+            mujoco.mj_kinematics(m, d)
+            hand_true = _min_dist(m, d, g_hand, g10) if human else np.inf
+            if vision and k % CAM_EVERY == 0:          # new camera frame (20 Hz)
+                dist, rgb, mask, _ = ov.monitor(d, t, V.ur10e_link_points(m, d))
+                vis.update(rgb=rgb, mask=mask, dist=dist, t_frame=t)
+            hand_d = vis["dist"] if vision else hand_true          # what the sensor reports
+            d_ssm = hand_d - VISION_MARGIN if vision else hand_d
+            s_target = float(np.clip((d_ssm - SSM_STOP) / (SSM_SLOW - SSM_STOP), 0, 1))
+            s10 += float(np.clip(s_target - s10, -SSM_RAMP, SSM_RAMP))
 
         # ── control ──
         d.ctrl[np.r_[r3.act, r10.act]] = ctrl(d, q_ref, qd_ref, qdd_ref, dt)
@@ -280,14 +307,16 @@ def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
             log["tcp_ref"].append(np.r_[ref_data.site_xpos[tcp3], ref_data.site_xpos[tcp10]])
             log["w"].append([r3.manipulability(d.qpos[r3.qadr]),
                              r10.manipulability(d.qpos[r10.qadr])])
-            log["hand_d"].append(hand_d)
+            log["hand_d"].append(hand_d if np.isfinite(hand_d) else np.nan)
+            log["hand_true"].append(hand_true if np.isfinite(hand_true) else np.nan)
             log["s10"].append(s10)
             log["clear"].append(_min_dist(m, d, g3, g10) if k % 50 == 0 else np.nan)
             log["push3"].append(p3)
             log["push10"].append(p10)
 
         if frame_cb is not None:
-            frame_cb(m, d, t, lab3 if ref10 is None else lab10, s10)
+            vis["state"] = "STOP" if s10 < 0.02 else "SLOW" if s10 < 0.98 else ""
+            frame_cb(m, d, t, lab3 if ref10 is None else lab10, s10, vis)
         if viewer is not None:
             if not viewer.is_running():
                 break
@@ -303,7 +332,18 @@ def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
     if viewer is not None:
         viewer.close()
 
-    out = {k: np.array(v) for k, v in log.items()}
+    if vis["pcb"] is not None:
+        tp, tq = vis["pcb_true"]
+        tyaw = 2 * np.arctan2(tq[3], tq[0])
+        est = vis["pcb"]
+        out_vision = dict(pos_err=1000 * np.linalg.norm(est["pos"][:2] - tp[:2]),
+                          yaw_err=np.rad2deg((est["yaw"] - tyaw + np.pi) % (2 * np.pi) - np.pi),
+                          pad_err=1000 * np.linalg.norm(
+                              V.pads_from_pose(est)[:, :2]
+                              - V.pads_from_pose(dict(pos=tp, yaw=tyaw))[:, :2], axis=1).max())
+    else:
+        out_vision = None
+    out = {k: np.array(v) for k, v in log.items()} | {"vision": out_vision, "vis": vis}
     out.update(controller=controller, gains=gains, model_error=model_error, push=push,
                human=human, start10=start10, cycle=end_t, solder_closest=closest,
                pcb_final=d.mocap_pos[pcb].copy(), pcb_quat=d.mocap_quat[pcb].copy(),
@@ -326,10 +366,23 @@ def summarise(o):
     print(f"  tool error UR10e mean {e10.mean():6.2f} mm  max {e10.max():7.2f} mm")
     print(f"  min manipulability / peak: UR3 {np.nanmin(w[:, 0]):.2f}  UR10e {np.nanmin(w[:, 1]):.2f}")
     print(f"  min UR3-UR10e clearance {1000 * np.nanmin(o['clear']):.0f} mm")
-    if np.isfinite(o["hand_d"]).any():
-        hold = (o["s10"] < 0.01).sum() * (o["t"][1] - o["t"][0])
-        print(f"  operator hand: closest {1000 * np.nanmin(o['hand_d']):.0f} mm, "
-              f"UR10e stopped for {hold:.1f} s")
+    if np.isfinite(o["hand_true"]).any():
+        dt_log = o["t"][1] - o["t"][0]
+        hold = (o["s10"] < 0.01).sum() * dt_log
+        inside = np.isfinite(o["hand_true"]) & (o["hand_true"] < SSM_STOP) & (o["s10"] > 0.02)
+        print(f"  operator hand: closest {1000 * np.nanmin(o['hand_true']):.0f} mm, "
+              f"UR10e stopped for {hold:.1f} s, moving inside {1000 * SSM_STOP:.0f} mm "
+              f"for {inside.sum() * dt_log:.2f} s")
+    if o.get("vision"):
+        v = o["vision"]
+        print(f"  camera PCB estimate: position error {v['pos_err']:.2f} mm, yaw error "
+              f"{v['yaw_err']:+.2f} deg, worst predicted-pad error {v['pad_err']:.2f} mm")
+    if np.isfinite(o["hand_true"]).any() and np.isfinite(o["hand_d"]).any():
+        both = np.isfinite(o["hand_true"]) & np.isfinite(o["hand_d"]) & (o["hand_true"] < 0.6)
+        if both.any():
+            err = 1000 * (o["hand_d"][both] - o["hand_true"][both])
+            print(f"  camera vs true operator distance (< 600 mm): mean {err.mean():+.0f} mm, "
+                  f"worst {err.min():+.0f} / {err.max():+.0f} mm")
     hits = [f"pad {i + 1} {1000 * c:.2f} mm" + ("" if c < SOLDER_TOL else " MISSED")
             for i, c in enumerate(o["solder_closest"])]
     print("  closest hot-tip approach: " + ", ".join(hits))
@@ -344,8 +397,10 @@ def main():
     ap.add_argument("--no-human", action="store_true")
     ap.add_argument("--speed", type=float, default=1.0, help="scale all segment speeds")
     ap.add_argument("--view", action="store_true")
+    ap.add_argument("--no-vision", action="store_true", help="use ground truth, not the camera")
     a = ap.parse_args()
-    run(a.controller, a.gains, a.model_error, not a.no_push, not a.no_human, a.speed, a.view)
+    run(a.controller, a.gains, a.model_error, not a.no_push, not a.no_human, a.speed, a.view,
+        vision=not a.no_vision)
 
 
 if __name__ == "__main__":
