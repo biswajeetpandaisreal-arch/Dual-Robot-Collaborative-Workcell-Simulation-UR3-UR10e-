@@ -1,4 +1,6 @@
-mujoco>=3.0
+mujoco>=3.3
 numpy
 matplotlib
 pillow
+# only needed to regenerate robots/ur3 with make_ur3.py
+# trimesh pycollada scipy

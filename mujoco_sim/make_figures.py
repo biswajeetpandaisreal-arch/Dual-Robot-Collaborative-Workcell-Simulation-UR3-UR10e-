@@ -2,13 +2,13 @@
 
     python make_figures.py          # writes into ../figures/
 
-Figures:
-  sim_workcell.png          MuJoCo render of the cell mid-cycle
-  sim_cell.gif              animated cycle (overlap schedule, tuned gains)
-  sim_controllers.png       tool-position error: MATLAB law vs computed torque
-  sim_disturbance.png       recovery after the push: MATLAB vs tuned gains
-  sim_coordination.png      clearance-based scheduling of the UR10e start
-  manipulability_fixed.png  Yoshikawa index before/after the Jacobian fix
+  sim_cell.gif              the full cycle (3x speed), with both induced errors
+  sim_workcell.png          the cell while the UR3 carries the PCB
+  sim_controllers.png       tool error: no dynamics model vs computed torque
+  sim_disturbance.png       push recovery: coursework gains vs tuned gains
+  sim_human.png             operator intrusion: separation and UR10e speed
+  sim_singularity.png       manipulability along the cycle, naive vs branch-locked IK
+  manipulability_fixed.png  MATLAB Jacobian before / after the DH-convention fix
 """
 
 from __future__ import annotations
@@ -23,14 +23,15 @@ import mujoco  # noqa: E402
 import numpy as np  # noqa: E402
 from PIL import Image, ImageDraw, ImageFont  # noqa: E402
 
+import planner  # noqa: E402
 import simulate as S  # noqa: E402
+from build_scene import build_model  # noqa: E402
 from cell_model import (ROBOTS, build_trajectory, jacobian,  # noqa: E402
                         jacobian_original, manipulability)
 
 OUT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "figures")
-BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
-INK, INK2, GRID, SURF = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb"
-RED = "#e34948"
+BLUE, ORANGE = "#2a78d6", "#eb6834"
+INK, INK2, GRID, SURF, RED = "#0b0b0b", "#52514e", "#e4e3df", "#fcfcfb", "#e34948"
 
 plt.rcParams.update({"font.family": "DejaVu Sans", "font.size": 10,
                      "axes.edgecolor": GRID, "axes.labelcolor": INK2,
@@ -48,10 +49,9 @@ def _style(ax):
 
 
 def _save(fig, name):
-    path = os.path.join(OUT, name)
-    fig.savefig(path, dpi=140, facecolor=SURF)
+    fig.savefig(os.path.join(OUT, name), dpi=140, facecolor=SURF)
     plt.close(fig)
-    print("wrote", os.path.relpath(path))
+    print("wrote figures/" + name)
 
 
 def tcp_err(o, robot):
@@ -59,34 +59,36 @@ def tcp_err(o, robot):
     return 1000 * np.linalg.norm(o["tcp"][:, sl] - o["tcp_ref"][:, sl], axis=1)
 
 
-# ── controllers ─────────────────────────────────────────────────────────────
+def _mark_events(ax, o, ymax):
+    for key, lab in (("push3", "UR3 push"), ("push10", "UR10e push")):
+        if o[key].any():
+            tp = o["t"][np.argmax(o[key])]
+            ax.axvline(tp, color=INK2, ls=":", lw=1)
+            ax.text(tp, ymax, f" {lab}", color=INK2, fontsize=8, va="top")
+    ax.axvline(o["start10"], color=INK2, lw=0.8, alpha=0.5)
+
+
 def fig_controllers(runs):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.2), sharey=True)
-    series = [("pid", "MATLAB PID+FF law used directly as torque", INK2),
-              ("ct", "Computed torque, MATLAB gains", ORANGE),
+    series = [("pid", "Coursework PID+FF law as raw torque (no dynamics model)", INK2),
+              ("ct_matlab", "Computed torque, coursework gains", ORANGE),
               ("ct_tuned", "Computed torque, tuned gains", BLUE)]
     for ax, robot in zip(axes, ("UR3", "UR10E")):
         for key, label, col in series:
             o = runs[key]
-            ax.plot(o["t"], np.maximum(tcp_err(o, robot), 1e-3), color=col, lw=1.6,
-                    label=label)
-        o = runs["ct"]
-        push = o["push3"] if robot == "UR3" else o["push10"]
-        tp = o["t"][np.argmax(push)]
-        ax.axvline(tp, color=INK2, ls=":", lw=1)
-        ax.text(tp, 2500, " push", color=INK2, fontsize=8.5, va="top")
+            ax.plot(o["t"], np.maximum(tcp_err(o, robot), 1e-3), color=col, lw=1.4, label=label)
+        _mark_events(ax, runs["ct_tuned"], 2500)
         ax.set_yscale("log")
-        ax.set_ylim(1e-2, 3e3)
+        ax.set_ylim(1e-3, 3e3)
         ax.set_xlabel("time (s)")
-        ax.set_title("UR3 — pick & place" if robot == "UR3" else "UR10e — soldering")
+        ax.set_title("UR3 — pick and place" if robot == "UR3" else "UR10e — soldering")
         _style(ax)
     axes[0].set_ylabel("tool position error (mm, log scale)")
     h, lab = axes[0].get_legend_handles_labels()
     fig.legend(h, lab, loc="upper center", ncol=3, frameon=False, fontsize=9,
                bbox_to_anchor=(0.5, 0.995))
-    fig.text(0.01, 0.01, "Sequential schedule, 50 ms tool push on each robot. Without a "
-             "dynamics model the UR10e cannot hold itself up against gravity.",
-             fontsize=8.5, color=INK2)
+    fig.text(0.01, 0.01, "Full cycle with both induced errors. Grey line: UR10e start "
+             "(after the UR3 has withdrawn from Pos4).", fontsize=8.5, color=INK2)
     fig.tight_layout(rect=(0, 0.04, 1, 0.92))
     _save(fig, "sim_controllers.png")
 
@@ -94,15 +96,14 @@ def fig_controllers(runs):
 def fig_disturbance(runs):
     fig, axes = plt.subplots(1, 2, figsize=(12, 4.0), sharey=True)
     for ax, me in zip(axes, (0.0, 0.15)):
-        for key, label, col in (("matlab", "MATLAB gains (pole at s = −0.10)", ORANGE),
-                                ("tuned", "Tuned gains (poles −28, −5.8 ± 6.1j)", BLUE)):
-            o = runs[f"dist_{key}_{me}"]
-            e = tcp_err(o, "UR10E")
-            ax.plot(o["t"], e, color=col, lw=1.8, label=label)
+        for g, label, col in (("matlab", "Coursework gains (pole at s = −0.10)", ORANGE),
+                              ("tuned", "Tuned gains (poles −28, −5.8 ± 6.1j)", BLUE)):
+            o = runs[f"dist_{g}_{me}"]
+            ax.plot(o["t"], tcp_err(o, "UR10E"), color=col, lw=1.8, label=label)
         tp = o["t"][np.argmax(o["push10"])]
-        ax.axvspan(tp, tp + 0.05, color=RED, alpha=0.25, lw=0)
-        ax.set_xlim(tp - 0.5, tp + 7)
-        ax.set_ylim(0, 40)
+        ax.axvspan(tp, tp + 0.05, color=RED, alpha=0.3, lw=0)
+        ax.set_xlim(tp - 1, tp + 8)
+        ax.set_ylim(0, 60)
         ax.set_xlabel("time (s)")
         ax.set_title("UR10e, perfect dynamics model" if me == 0
                      else "UR10e, controller's model 15 % too heavy")
@@ -111,46 +112,64 @@ def fig_disturbance(runs):
     h, lab = axes[0].get_legend_handles_labels()
     fig.legend(h, lab, loc="upper center", ncol=2, frameon=False, fontsize=9,
                bbox_to_anchor=(0.5, 0.995))
-    fig.text(0.01, 0.01, "Red band: 150 N, 50 ms push on the tool. The MATLAB integral "
-             "gain leaves a ~10 s tail; the 5 mm solder tolerance is missed under model "
-             "error.", fontsize=8.5, color=INK2)
+    fig.text(0.01, 0.01, "Red band: 100 N, 50 ms knock on the solder tool between pads 2 "
+             "and 3.", fontsize=8.5, color=INK2)
     fig.tight_layout(rect=(0, 0.04, 1, 0.92))
     _save(fig, "sim_disturbance.png")
 
 
-def fig_coordination(seq, ovl):
-    fig, axes = plt.subplots(1, 2, figsize=(12, 4.0), gridspec_kw=dict(width_ratios=[1, 1.3]))
-    sw = ovl["sweep"]
-    ax = axes[0]
-    ok = ~np.isnan(sw[:, 1])
-    ax.plot(sw[ok, 0], 1000 * sw[ok, 1], color=BLUE, lw=1.8, marker="o", ms=3)
-    ax.axhline(1000 * S.SAFETY_MARGIN, color=RED, ls="--", lw=1.2)
-    ax.text(7.45, 1000 * S.SAFETY_MARGIN + 12, "50 mm safety margin", color=RED,
-            fontsize=8.5)
-    ax.axvline(ovl["start10"], color=INK2, ls=":", lw=1)
-    ax.text(ovl["start10"], ax.get_ylim()[1] * 0.95,
-            f" chosen start {ovl['start10']:.1f} s", color=INK, fontsize=8.5, va="top")
-    ax.set_xlabel("UR10e start time (s)")
-    ax.set_ylabel("worst-case clearance (mm; < 0 = collision)")
-    ax.set_title("Planning: earliest safe UR10e start")
-    _style(ax)
-    ax = axes[1]
-    for o, label, col in ((seq, f"sequential (cycle {seq['ur3_T'] + seq['ur10_T']:.1f} s)",
-                           INK2),
-                          (ovl, f"overlapped (cycle {ovl['start10'] + ovl['ur10_T']:.1f} s)",
-                           BLUE)):
-        ax.plot(o["t"], 1000 * np.minimum(o["clear"], 0.6), color=col, lw=1.8, label=label)
-    ax.axhline(1000 * S.SAFETY_MARGIN, color=RED, ls="--", lw=1.2)
+def fig_human(o):
+    fig, ax = plt.subplots(figsize=(12, 3.8))
+    ok = np.isfinite(o["hand_d"])
+    t0 = o["t"][ok][0]
+    ax.plot(o["t"][ok], 1000 * o["hand_d"][ok], color=ORANGE, lw=1.8,
+            label="operator hand ↔ UR10e distance (mm)")
+    ax.axhline(1000 * S.SSM_SLOW, color=INK2, ls="--", lw=1)
+    ax.axhline(1000 * S.SSM_STOP, color=RED, ls="--", lw=1)
+    ax.text(t0 + 8.2, 1000 * S.SSM_SLOW + 12, "slow below 400 mm", color=INK2, fontsize=8.5)
+    ax.text(t0 + 8.2, 1000 * S.SSM_STOP + 12, "stop below 250 mm", color=RED, fontsize=8.5)
+    ax.set_ylabel("distance (mm)")
+    ax.set_ylim(0, 900)
+    ax.set_xlim(t0 - 1, t0 + 12)
+    ax2 = ax.twinx()
+    ax2.plot(o["t"], o["s10"], color=BLUE, lw=1.8, label="UR10e speed scale")
+    ax2.set_ylim(-0.05, 1.1)
+    ax2.set_ylabel("UR10e speed scale", color=BLUE)
+    ax2.tick_params(length=0, colors=BLUE)
+    ax2.spines["top"].set_visible(False)
     ax.set_xlabel("time (s)")
-    ax.set_ylabel("robot-robot clearance (mm, capped at 600)")
-    ax.set_title("Executed: clearance during the cycle")
-    ax.legend(frameon=False, fontsize=9, loc="lower right")
+    ax.set_title("Unexpected human movement: speed and separation monitoring")
     _style(ax)
+    h1, l1 = ax.get_legend_handles_labels()
+    h2, l2 = ax2.get_legend_handles_labels()
+    ax.legend(h1 + h2, l1 + l2, frameon=False, fontsize=9, loc="upper right")
     fig.tight_layout()
-    _save(fig, "sim_coordination.png")
+    _save(fig, "sim_human.png")
 
 
-def fig_manipulability():
+def fig_singularity(o):
+    fig, axes = plt.subplots(1, 2, figsize=(12, 3.8), sharey=True)
+    for ax, key, name in ((axes[0], "plan3", "UR3"), (axes[1], "plan10", "UR10e")):
+        pl = o[key]
+        r = pl["w"] / pl["w_peak"]
+        ax.plot(pl["t"], r, color=BLUE, lw=1.8)
+        ax.axhline(planner.W_FRAC, color=RED, ls="--", lw=1.1)
+        ax.text(0.2, planner.W_FRAC + 0.025, "near-singular threshold (5 % of peak)",
+                color=RED, fontsize=8.5)
+        i = np.argmin(r)
+        ax.annotate(f"minimum {r[i]:.2f} ('{pl['label'][i]}')", (pl["t"][i], r[i]),
+                    (pl["t"][i], r[i] - 0.22), fontsize=8.5, color=INK, ha="center",
+                    arrowprops=dict(arrowstyle="->", color=INK2, lw=0.8))
+        ax.set_ylim(0, 1.1)
+        ax.set_xlabel("path time (s)")
+        ax.set_title(f"{name}: manipulability along the planned path")
+        _style(ax)
+    axes[0].set_ylabel("w / peak w")
+    fig.tight_layout()
+    _save(fig, "sim_singularity.png")
+
+
+def fig_manipulability_matlab():
     fig, axes = plt.subplots(2, 2, figsize=(12, 6.2), sharex="col")
     for col, name in enumerate(("UR3", "UR10E")):
         tr = build_trajectory(name, 0.01)
@@ -172,8 +191,8 @@ def fig_manipulability():
                 ax.set_ylabel("w / max w")
             if row == 1:
                 ax.set_xlabel("time (s)")
-    fig.suptitle("Yoshikawa manipulability along the trajectory  (dashed: 5 % threshold, "
-                 "shaded: near-singular)", x=0.01, ha="left", fontsize=11.5)
+    fig.suptitle("MATLAB model: Yoshikawa manipulability along the coursework trajectory",
+                 x=0.01, ha="left", fontsize=11.5)
     fig.tight_layout(rect=(0, 0, 1, 0.95))
     _save(fig, "manipulability_fixed.png")
 
@@ -190,35 +209,36 @@ def _font(size):
 
 def renders():
     W, H = 960, 540
-    frames, snapshot = [], {}
+    frames, snap = [], {}
     cam = mujoco.MjvCamera()
-    cam.lookat[:] = [0.60, 1.05, 0.45]
-    cam.distance, cam.azimuth, cam.elevation = 2.9, 130.0, -24.0
-    state = {"r": None, "next": 0.0}
+    cam.lookat[:] = [0.60, 1.00, 0.22]
+    cam.distance, cam.azimuth, cam.elevation = 2.2, 150.0, -32.0
+    st = {"r": None, "next": 0.0}
 
-    def cb(m, d, t):
-        if state["r"] is None:
-            state["r"] = mujoco.Renderer(m, H, W)
-        if t + 1e-9 < state["next"]:
+    def cb(m, d, t, label, s10):
+        if st["r"] is None:
+            st["r"] = mujoco.Renderer(m, H, W)
+        if t + 1e-9 < st["next"]:
             return
-        state["next"] += 0.1                     # 10 Hz capture, played at 15 fps
-        r = state["r"]
-        r.update_scene(d, camera=cam)
-        img = Image.fromarray(r.render())
+        st["next"] += 0.2                       # 5 Hz capture, played at 15 fps = 3x
+        st["r"].update_scene(d, camera=cam)
+        img = Image.fromarray(st["r"].render())
         dr = ImageDraw.Draw(img)
-        dr.rectangle([0, 0, W, 34], fill=(252, 252, 251))
-        dr.text((12, 8), f"t = {t:4.1f} s   UR3 (teal gripper): PCB Pos3 → Pos4   ·   "
-                f"UR10e (orange iron): solder P1–P4   ·   1.5× speed",
-                font=_font(16), fill=(11, 11, 11))
+        dr.rectangle([0, 0, W, 36], fill=(252, 252, 251))
+        state = ("UR10e STOPPED — operator too close" if s10 < 0.02 else
+                 "UR10e slowed — operator nearby" if s10 < 0.98 else label)
+        col = (227, 73, 72) if s10 < 0.98 else (11, 11, 11)
+        dr.text((12, 8), f"t = {t:4.1f} s", font=_font(17), fill=(11, 11, 11))
+        dr.text((130, 8), state, font=_font(17), fill=col)
+        dr.text((W - 80, 9), "3× speed", font=_font(15), fill=(82, 81, 78))
         frames.append(img)
-        if abs(t - 6.6) < 0.05:
-            snapshot["img"] = img
+        if abs(t - 11.0) < 0.05:
+            snap["img"] = img
 
-    S.run("ct", "overlap", disturb=False, gains="tuned", quiet=True, frame_cb=cb)
-    snapshot.get("img", frames[len(frames) // 2]).save(os.path.join(OUT, "sim_workcell.png"))
+    S.run(quiet=True, frame_cb=cb)
+    snap.get("img", frames[len(frames) // 3]).save(os.path.join(OUT, "sim_workcell.png"))
     print("wrote figures/sim_workcell.png")
-    small = [f.resize((720, 405), Image.LANCZOS).quantize(
-                 colors=128, method=Image.MEDIANCUT, dither=Image.Dither.FLOYDSTEINBERG)
+    small = [f.resize((720, 405), Image.LANCZOS).quantize(colors=128, method=Image.MEDIANCUT)
              for f in frames]
     path = os.path.join(OUT, "sim_cell.gif")
     small[0].save(path, save_all=True, append_images=small[1:], duration=67, loop=0,
@@ -229,21 +249,17 @@ def renders():
 
 def main():
     os.makedirs(OUT, exist_ok=True)
-    fig_manipulability()
-    runs = {
-        "pid": S.run("pid", "sequential", quiet=True),
-        "ct": S.run("ct", "sequential", quiet=True),
-        "ct_tuned": S.run("ct", "sequential", quiet=True, gains="tuned"),
-    }
+    fig_manipulability_matlab()
+    runs = {"pid": S.run("pid", "matlab", quiet=True),
+            "ct_matlab": S.run("ct", "matlab", quiet=True),
+            "ct_tuned": S.run("ct", "tuned", quiet=True)}
     fig_controllers(runs)
+    fig_human(runs["ct_tuned"])
+    fig_singularity(runs["ct_tuned"])
     for g in ("matlab", "tuned"):
-        for me in (0.0, 0.15):
-            runs[f"dist_{g}_{me}"] = S.run("ct", "sequential", model_error=me,
-                                           gains=g, quiet=True)
+        runs[f"dist_{g}_0.0"] = runs[f"ct_{g}"]
+        runs[f"dist_{g}_0.15"] = S.run("ct", g, model_error=0.15, quiet=True)
     fig_disturbance(runs)
-    seq = S.run("ct", "sequential", gains="tuned", quiet=True)
-    ovl = S.run("ct", "overlap", gains="tuned", quiet=True)
-    fig_coordination(seq, ovl)
     renders()
 
 

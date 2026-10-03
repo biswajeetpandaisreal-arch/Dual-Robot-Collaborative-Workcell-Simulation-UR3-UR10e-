@@ -1,248 +1,264 @@
-"""Dynamic MuJoCo simulation of the UR3 + UR10e workcell.
+"""Dynamic MuJoCo simulation of the soldering cell (assignment brief, Part C).
 
-What the MATLAB version idealises, this simulates:
-  * full rigid-body dynamics (gravity, inertia, coupling) at 1 kHz
-  * the MATLAB PID+FF law, either applied directly as joint torque ("pid") or
-    as the outer loop of a computed-torque controller ("ct"), which is the
-    physical controller the MATLAB double-integrator model implicitly assumes
-  * a real disturbance: a 50 ms force push on each robot's tool
-  * the UR3 actually carrying the PCB from Pos3 to Pos4, and the UR10e's
-    iron tip being checked against the four solder points
-  * coordination: the UR10e can start before the UR3 has finished, with the
-    start time chosen so the two arms keep a minimum clearance
+Sequence (as the brief specifies): the UR3 picks the PCB from Pos3 and places
+it on Pos4; once it has withdrawn, the UR10e solders four header pads. The
+UR10e is planned from the PCB pose *as placed* (what the overhead camera would
+measure), so placement error does not become soldering error.
+
+Control: computed torque, tau = M(q)(qdd_ref + Kp e + Ki int(e) + Kd de) + h(q, dq),
+on full rigid-body dynamics at 1 kHz. "pid" applies the outer loop directly as
+torque (no dynamics model) for comparison.
+
+Induced errors handled by the controller (Part C):
+  push   a 50 ms force on each tool (an unexpected collision)
+  human  an operator's hand reaches round the shield toward the PCB while the
+         UR10e is soldering; speed and separation monitoring slows the UR10e
+         below 400 mm and stops it below 250 mm, resuming when clear
 
 Usage:
-    python simulate.py                          # computed torque, sequential
-    python simulate.py --schedule overlap       # earliest safe UR10e start
-    python simulate.py --controller pid         # MATLAB law as raw torque
-    python simulate.py --model-error 0.15       # controller model 15% off
-    python simulate.py --gains tuned            # stiffer outer-loop gains
-    python simulate.py --view                   # live MuJoCo viewer
+    python simulate.py --view                 # watch it (tuned gains, both errors)
+    python simulate.py --gains matlab         # coursework gains
+    python simulate.py --controller pid       # no dynamics model
+    python simulate.py --model-error 0.15     # controller's model 15 % too heavy
+    python simulate.py --no-push --no-human   # nominal cycle
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import time
 
 import mujoco
 import numpy as np
 
-from cell_model import CELL, build_trajectory, yxz_mm_to_world_m
+from build_scene import build_model
+from planner import DT_PLAN, HOME_UR, Robot, plan_ur10e, plan_ur3
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-XML = os.path.join(HERE, "workcell.xml")
-
-# Outer-loop gains (acceleration units). "matlab" = cfg_partC.m. Its integral
-# gain puts a closed-loop pole at s = -0.10 (a ~10 s time constant), so errors
-# after a disturbance or under model error linger. "tuned" places the poles at
-# s = -28 and -5.8 +/- 6.1j.
-GAINS = {
-    "matlab": dict(kp=[50, 50, 50, 30, 30, 30], ki=[5, 5, 5, 3, 3, 3],
-                   kd=[10, 10, 10, 6, 6, 6]),
+GAINS = {   # outer-loop gains (acceleration units); "matlab" = cfg_partC.m
+    "matlab": dict(kp=[50, 50, 50, 30, 30, 30], ki=[5, 5, 5, 3, 3, 3], kd=[10, 10, 10, 6, 6, 6]),
     "tuned": dict(kp=[400] * 6, ki=[2000] * 6, kd=[40] * 6),
 }
 INT_LIMIT = 1.0
-
-ROBOTS = {  # name -> (prefix, dof slice, disturbance time [s, robot-local], force [N])
-    "UR3": ("ur3", slice(0, 6), 2.5, 40.0),
-    "UR10E": ("ur10e", slice(6, 12), 3.0, 150.0),
-}
-SAFETY_MARGIN = 0.05    # m, minimum robot-robot clearance for the overlap schedule
-SOLDER_TOL = 0.005      # m, tip must be within this of a solder point while hot
+FINGER_OPEN, FINGER_CLOSED = 0.012, 0.0
+SSM_STOP, SSM_SLOW = 0.25, 0.40       # m: speed and separation monitoring
+SOLDER_TOL = 0.001                    # m: tip must be within 1 mm of a pad
 
 
-# ── reference schedule ─────────────────────────────────────────────────────
 class Reference:
-    """Trajectory of one robot, holding its first/last pose outside [t0, t0+T]."""
+    """A planned path played back on its own clock (so it can be paused)."""
 
-    def __init__(self, name, t0, dt):
-        self.tr = build_trajectory(name, dt)
-        self.t0, self.dt = t0, dt
-        self.T = self.tr["t"][-1]
+    def __init__(self, plan):
+        self.p = plan
+        self.tau = 0.0              # path time
+        self.T = plan["t"][-1]
 
-    def at(self, t):
-        k = int(round((t - self.t0) / self.dt))
-        k = min(max(k, 0), len(self.tr["t"]) - 1)
-        moving = 0.0 <= t - self.t0 <= self.T
-        z = np.zeros(6)
-        return (self.tr["q"][k],
-                self.tr["qd"][k] if moving else z,
-                self.tr["qdd"][k] if moving else z,
-                self.tr["tool"][k])
+    def sample(self):
+        x = min(self.tau / DT_PLAN, len(self.p["t"]) - 1.001)
+        i, f = int(x), x - int(x)
 
+        def lerp(a):
+            return (1 - f) * a[i] + f * a[i + 1]
+        return (lerp(self.p["q"]), lerp(self.p["qd"]), lerp(self.p["qdd"]),
+                self.p["tool"][i], self.p["label"][i])
 
-def robot_geoms(m, prefix):
-    return [g for g in range(m.ngeom)
-            if (m.geom(g).name or "").startswith(prefix + "_")
-            or m.body(m.geom_bodyid[g]).name.startswith(prefix + "_")]
+    @property
+    def done(self):
+        return self.tau >= self.T
 
 
-def min_clearance(m, d, g_a, g_b, distmax=0.6):
-    best = distmax
-    fromto = np.zeros(6)
-    for a in g_a:
-        for b in g_b:
-            best = min(best, mujoco.mj_geomDistance(m, d, a, b, distmax, fromto))
-    return best
-
-
-def plan_overlap(m, dt=0.01, margin=SAFETY_MARGIN):
-    """Earliest UR10e start (kinematic sweep) that keeps `margin` clearance and
-    lets the UR3 place the PCB before the iron reaches the first point."""
-    d = mujoco.MjData(m)
-    ga, gb = robot_geoms(m, "ur3"), robot_geoms(m, "ur10e")
-    r3 = Reference("UR3", 0.0, dt)
-    tool = r3.tr["tool"]
-    release_t = r3.tr["t"][np.where(np.diff(tool) < 0)[0][0] + 1]
-    r10 = Reference("UR10E", 0.0, dt)
-    first_hot = r10.tr["t"][np.argmax(r10.tr["tool"] > 0)]
-    sweep = []
-    for start in np.arange(0.0, r3.T + 1e-9, 0.1):
-        r10.t0 = start
-        if start + first_hot < release_t + 0.2:     # PCB must be placed first
-            sweep.append((start, np.nan))
-            continue
-        worst = np.inf
-        for t in np.arange(start, r3.T + 1e-9, 0.05):  # overlap window only
-            d.qpos[:6] = r3.at(t)[0]
-            d.qpos[6:] = r10.at(t)[0]
-            mujoco.mj_kinematics(m, d)
-            worst = min(worst, min_clearance(m, d, ga, gb))
-        sweep.append((start, worst))
-    ok = [s for s, c in sweep if not np.isnan(c) and c >= margin]
-    return (ok[0] if ok else r3.T), np.array(sweep), release_t
-
-
-# ── controller ─────────────────────────────────────────────────────────────
 class Controller:
-    def __init__(self, m, kind, model_error=0.0, gains="matlab"):
+    def __init__(self, robots, kind="ct", gains="tuned", model_error=0.0):
         self.kind = kind
-        g = GAINS[gains]
-        self.kp, self.ki, self.kd = (np.tile(np.array(g[k], float), 2)
-                                     for k in ("kp", "ki", "kd"))
-        self.mc = mujoco.MjModel.from_xml_path(XML)     # controller's own model
+        self.mc = build_model()                      # the controller's own model
         if model_error:
             for b in range(self.mc.nbody):
                 if self.mc.body(b).name.startswith(("ur3_", "ur10e_")):
                     self.mc.body_mass[b] *= 1 + model_error
                     self.mc.body_inertia[b] *= 1 + model_error
         self.dc = mujoco.MjData(self.mc)
-        self.M = np.zeros((m.nv, m.nv))
-        self.e_int = np.zeros(m.nv)
+        self.M = np.zeros((self.mc.nv, self.mc.nv))
+        self.qadr = np.concatenate([r.qadr for r in robots])
+        self.dofs = np.concatenate([r.dadr for r in robots])
+        g = GAINS[gains]
+        self.kp, self.ki, self.kd = (np.tile(np.array(g[k], float), 2) for k in ("kp", "ki", "kd"))
+        self.e_int = np.zeros(12)
 
     def __call__(self, d, q_ref, qd_ref, qdd_ref, dt):
-        e = q_ref - d.qpos
-        ed = qd_ref - d.qvel
+        e = q_ref - d.qpos[self.qadr]
+        ed = qd_ref - d.qvel[self.dofs]
         self.e_int = np.clip(self.e_int + e * dt, -INT_LIMIT, INT_LIMIT)
         v = qdd_ref + self.kp * e + self.ki * self.e_int + self.kd * ed
-        if self.kind == "pid":   # MATLAB law, output used directly as torque
+        if self.kind == "pid":
             return v
         self.dc.qpos[:] = d.qpos
         self.dc.qvel[:] = d.qvel
         mujoco.mj_forward(self.mc, self.dc)
         mujoco.mj_fullM(self.mc, self.dc, self.M)
-        # computed torque: M(q) v + Coriolis/gravity - passive joint damping
-        return self.M @ v + self.dc.qfrc_bias - self.dc.qfrc_passive
+        ix = np.ix_(self.dofs, self.dofs)
+        return (self.M[ix] @ v + self.dc.qfrc_bias[self.dofs]
+                - self.dc.qfrc_passive[self.dofs])
 
 
-# ── simulation ─────────────────────────────────────────────────────────────
-def run(controller="ct", schedule="sequential", disturb=True, model_error=0.0,
-        view=False, log_every=10, quiet=False, gains="matlab", frame_cb=None):
-    m = mujoco.MjModel.from_xml_path(XML)
+def _geoms_of(m, prefix):
+    return [g for g in range(m.ngeom) if m.body(m.geom_bodyid[g]).name.startswith(prefix)
+            and m.geom_group[g] != 2]          # skip visual meshes: hulls/capsules + tools
+
+
+def _min_dist(m, d, ga, gb, cap=1.0):
+    ft = np.zeros(6)
+    return min(mujoco.mj_geomDistance(m, d, a, b, cap, ft) for a in ga for b in gb)
+
+
+HAND_PTS = np.array([[1.30, 1.80, 0.32], [0.80, 1.70, 0.28], [0.50, 1.22, 0.22]])
+HAND_PARK = np.array([3.0, 3.0, -3.0])        # out of sight until needed
+
+
+def _hand_path(t, t0):
+    """Operator reaches round the end of the shield toward the PCB, holds,
+    and withdraws."""
+    legs = [(t0, t0 + 1.0, 0, 1), (t0 + 1.0, t0 + 2.2, 1, 2),
+            (t0 + 4.7, t0 + 5.9, 2, 1), (t0 + 5.9, t0 + 6.9, 1, 0)]
+    for a, b, i, j in legs:
+        if a <= t < b:
+            s = (t - a) / (b - a)
+            s = 10 * s**3 - 15 * s**4 + 6 * s**5
+            return HAND_PTS[i] + s * (HAND_PTS[j] - HAND_PTS[i])
+    if t0 + 2.2 <= t < t0 + 4.7:
+        return HAND_PTS[2]
+    return HAND_PARK
+
+
+def _seg_time(plan, label, frac):
+    for a, b, lab in plan["segments"]:
+        if lab == label:
+            return a + frac * (b - a)
+    raise KeyError(label)
+
+
+def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
+        speed=1.0, view=False, log_every=10, frame_cb=None, quiet=False):
+    m = build_model()
     d = mujoco.MjData(m)
     dt = m.opt.timestep
+    r3, r10 = Robot(m, "ur3"), Robot(m, "ur10e")
+    ctrl = Controller((r3, r10), controller, gains, model_error)
 
-    if schedule == "overlap":
-        start10, sweep, _ = plan_overlap(m)
-    else:
-        start10, sweep = Reference("UR3", 0, 0.01).T, None
-    refs = {"UR3": Reference("UR3", 0.0, dt), "UR10E": Reference("UR10E", start10, dt)}
-    t_end = max(r.t0 + r.T for r in refs.values()) + 0.5
-
-    ctrl = Controller(m, controller, model_error, gains)
-    for name, (_, sl, _, _) in ROBOTS.items():
-        d.qpos[sl] = refs[name].at(0.0)[0]
+    plan3 = plan_ur3(m, speed)
+    ref3, ref10, plan10 = Reference(plan3), None, None
+    d.qpos[r3.qadr] = plan3["q"][0]
+    d.qpos[r10.qadr] = HOME_UR
     mujoco.mj_forward(m, d)
 
-    ga, gb = robot_geoms(m, "ur3"), robot_geoms(m, "ur10e")
-    tcp = {n: m.site(f"{p}_tcp").id for n, (p, *_) in ROBOTS.items()}
-    tool_body = {n: m.body(f"{p}_link6").id for n, (p, *_) in ROBOTS.items()}
-    pcb_mocap = m.body_mocapid[m.body("pcb").id]
-    solder_sites = [m.site(f"solder{i + 1}").id for i in range(4)]
-    solder_pts = yxz_mm_to_world_m(CELL["P"])
-    closest = np.full(4, np.inf)     # closest hot-tip approach per point [m]
-    grasp_off = None
-    prev_tool3 = 0.0
+    tcp3, tcp10 = m.site("ur3_tcp").id, m.site("ur10e_tcp").id
+    tool3, tool10 = m.body("ur3_tool").id, m.body("ur10e_tool").id
+    pcb = m.body_mocapid[m.body("pcb").id]
+    hand = m.body_mocapid[m.body("hand").id]
+    pad_sites = [m.site(f"solder{i + 1}").id for i in range(4)]
+    pad_geoms = [m.geom(f"pad{i + 1}").id for i in range(4)]
+    g3, g10 = _geoms_of(m, "ur3_"), _geoms_of(m, "ur10e_")
+    g_hand = [m.geom("hand").id, m.geom("forearm").id]
+    fing = [m.actuator("ur3_finger_a").id, m.actuator("ur3_finger_b").id]
 
-    ref_data = mujoco.MjData(m)        # for reference TCP positions
-    log = {k: [] for k in ("t", "q", "q_ref", "tau", "tcp", "tcp_ref", "clear",
-                           "push3", "push10")}
-
-    viewer = mujoco.viewer.launch_passive(m, d) if view else None
+    push3_t = _seg_time(plan3, "carry PCB", 0.45)
+    push10_t = human_t0 = start10 = end_t = None
+    grasp, prev_tool3, s10, hand_d = None, 0.0, 1.0, np.nan
+    closest = np.full(4, np.inf)
+    ref_data = mujoco.MjData(m)
+    log = {k: [] for k in ("t", "q", "q_ref", "tau", "tcp", "tcp_ref", "w", "hand_d",
+                           "s10", "clear", "push3", "push10")}
+    viewer = None
+    if view:
+        from mujoco import viewer as mj_viewer
+        viewer = mj_viewer.launch_passive(m, d)
     wall0 = time.time()
-    n_steps = int(t_end / dt)
-    for k in range(n_steps):
+    k = 0
+    while True:
         t = k * dt
-        q_ref, qd_ref, qdd_ref, tools = np.zeros(12), np.zeros(12), np.zeros(12), {}
-        for name, (_, sl, _, _) in ROBOTS.items():
-            q_ref[sl], qd_ref[sl], qdd_ref[sl], tools[name] = refs[name].at(t)
+        # ── references ──
+        q_ref, qd_ref, qdd_ref = np.zeros(12), np.zeros(12), np.zeros(12)
+        q_ref[:6], qd_ref[:6], qdd_ref[:6], tool3_cmd, lab3 = ref3.sample()
+        if ref10 is None and lab3 == "return home":
+            # UR3 has released the PCB and withdrawn: measure the PCB, plan UR10e
+            start10 = t
+            plan10 = plan_ur10e(m, d.mocap_pos[pcb].copy(), d.mocap_quat[pcb].copy(), speed)
+            ref10 = Reference(plan10)
+            push10_t = _seg_time(plan10, "to pad 3", 0.5)
+            human_t0 = start10 + _seg_time(plan10, "solder pad 2", 0.2) - 2.2
+        if ref10 is None:
+            q_ref[6:], tool10_cmd, lab10 = HOME_UR, 0.0, "wait"
+        else:
+            q_ref[6:], qd10, qdd10, tool10_cmd, lab10 = ref10.sample()
+            qd_ref[6:], qdd_ref[6:] = s10 * qd10, s10**2 * qdd10
 
-        d.ctrl[:] = ctrl(d, q_ref, qd_ref, qdd_ref, dt)
+        # ── operator's hand + speed and separation monitoring (every 10 ms) ──
+        if human and human_t0 is not None:
+            d.mocap_pos[hand] = _hand_path(t, human_t0)
+            if t >= human_t0 and k % 10 == 0:
+                mujoco.mj_kinematics(m, d)
+                hand_d = _min_dist(m, d, g_hand, g10)
+                s_target = float(np.clip((hand_d - SSM_STOP) / (SSM_SLOW - SSM_STOP), 0, 1))
+                s10 += float(np.clip(s_target - s10, -0.025, 0.025))   # <= 2.5 /s ramp
 
-        # disturbance: 50 ms horizontal push on each tool, at its MATLAB time
+        # ── control ──
+        d.ctrl[np.r_[r3.act, r10.act]] = ctrl(d, q_ref, qd_ref, qdd_ref, dt)
+        d.ctrl[fing] = FINGER_CLOSED if tool3_cmd > 0.5 else FINGER_OPEN
         d.xfrc_applied[:] = 0
-        pushes = {}
-        for name, (_, _, t_dist, f) in ROBOTS.items():
-            local = t - refs[name].t0
-            on = disturb and t_dist <= local < t_dist + 0.05
-            pushes[name] = on
-            if on:
-                d.xfrc_applied[tool_body[name], :3] = [0.0, f, 0.0]
+        p3 = push and push3_t <= ref3.tau < push3_t + 0.05
+        p10 = push and ref10 is not None and push10_t <= ref10.tau < push10_t + 0.05
+        if p3:
+            d.xfrc_applied[tool3, :3] = [0, 0, -30.0]      # 30 N downward knock
+        if p10:
+            d.xfrc_applied[tool10, :3] = [100.0, 0, 0]     # 100 N sideways knock
 
         mujoco.mj_step(m, d)
 
-        # UR3 gripper: carry the PCB while closed
-        tool3 = tools["UR3"]
-        R = d.site_xmat[tcp["UR3"]].reshape(3, 3)
-        p = d.site_xpos[tcp["UR3"]]
-        if tool3 > 0.5 and prev_tool3 <= 0.5:
-            pcb_R = np.zeros(9)
-            mujoco.mju_quat2Mat(pcb_R, d.mocap_quat[pcb_mocap])
-            grasp_off = (R.T @ (d.mocap_pos[pcb_mocap] - p),
-                         R.T @ pcb_R.reshape(3, 3))
-        if tool3 > 0.5 and grasp_off is not None:
-            d.mocap_pos[pcb_mocap] = p + R @ grasp_off[0]
-            q = np.zeros(4)
-            mujoco.mju_mat2Quat(q, (R @ grasp_off[1]).flatten())
-            d.mocap_quat[pcb_mocap] = q
-        prev_tool3 = tool3
+        # ── PCB carried while gripped ──
+        R = d.site_xmat[tcp3].reshape(3, 3)
+        p = d.site_xpos[tcp3]
+        if tool3_cmd > 0.5 and prev_tool3 <= 0.5:
+            Rp = np.zeros(9)
+            mujoco.mju_quat2Mat(Rp, d.mocap_quat[pcb])
+            grasp = (R.T @ (d.mocap_pos[pcb] - p), R.T @ Rp.reshape(3, 3))
+        if tool3_cmd > 0.5 and grasp is not None:
+            d.mocap_pos[pcb] = p + R @ grasp[0]
+            qq = np.zeros(4)
+            mujoco.mju_mat2Quat(qq, (R @ grasp[1]).flatten())
+            d.mocap_quat[pcb] = qq
+        prev_tool3 = tool3_cmd
 
-        # UR10e iron: record how close the hot tip gets to each solder point
-        if tools["UR10E"] > 0.5:
-            tip = d.site_xpos[tcp["UR10E"]]
-            for i, sp in enumerate(solder_pts):
-                closest[i] = min(closest[i], np.linalg.norm(tip - sp))
+        # ── soldering: hot tip within 1 mm of a pad ──
+        if ref10 is not None and tool10_cmd > 0.5:
+            tip = d.site_xpos[tcp10]
+            for i, sid in enumerate(pad_sites):
+                closest[i] = min(closest[i], np.linalg.norm(tip - d.site_xpos[sid]))
                 if closest[i] < SOLDER_TOL:
-                    m.site_rgba[solder_sites[i]] = [0.75, 0.75, 0.8, 1]
+                    m.geom_rgba[pad_geoms[i]] = [0.78, 0.78, 0.82, 1]
+
+        # ── advance path clocks ──
+        ref3.tau += dt
+        if ref10 is not None:
+            ref10.tau += s10 * dt
 
         if k % log_every == 0:
-            ref_data.qpos[:] = q_ref
+            ref_data.qpos[:] = d.qpos
+            ref_data.qpos[r3.qadr], ref_data.qpos[r10.qadr] = q_ref[:6], q_ref[6:]
             mujoco.mj_kinematics(m, ref_data)
             log["t"].append(t)
-            log["q"].append(d.qpos.copy())
+            log["q"].append(np.r_[d.qpos[r3.qadr], d.qpos[r10.qadr]])
             log["q_ref"].append(q_ref.copy())
-            log["tau"].append(d.ctrl.copy())
-            log["tcp"].append(np.r_[d.site_xpos[tcp["UR3"]], d.site_xpos[tcp["UR10E"]]])
-            log["tcp_ref"].append(np.r_[ref_data.site_xpos[tcp["UR3"]],
-                                        ref_data.site_xpos[tcp["UR10E"]]])
-            log["clear"].append(min_clearance(m, d, ga, gb))
-            log["push3"].append(pushes["UR3"])
-            log["push10"].append(pushes["UR10E"])
+            log["tau"].append(d.ctrl[np.r_[r3.act, r10.act]].copy())
+            log["tcp"].append(np.r_[d.site_xpos[tcp3], d.site_xpos[tcp10]])
+            log["tcp_ref"].append(np.r_[ref_data.site_xpos[tcp3], ref_data.site_xpos[tcp10]])
+            log["w"].append([r3.manipulability(d.qpos[r3.qadr]),
+                             r10.manipulability(d.qpos[r10.qadr])])
+            log["hand_d"].append(hand_d)
+            log["s10"].append(s10)
+            log["clear"].append(_min_dist(m, d, g3, g10) if k % 50 == 0 else np.nan)
+            log["push3"].append(p3)
+            log["push10"].append(p10)
 
         if frame_cb is not None:
-            frame_cb(m, d, t)
+            frame_cb(m, d, t, lab3 if ref10 is None else lab10, s10)
         if viewer is not None:
             if not viewer.is_running():
                 break
@@ -250,35 +266,42 @@ def run(controller="ct", schedule="sequential", disturb=True, model_error=0.0,
             lag = t - (time.time() - wall0)
             if lag > 0:
                 time.sleep(lag)
+        k += 1
+        if ref10 is not None and ref10.done and end_t is None:
+            end_t = t
+        if (end_t is not None and t > end_t + 0.5) or t > 150:
+            break
     if viewer is not None:
         viewer.close()
 
     out = {k: np.array(v) for k, v in log.items()}
-    out.update(start10=start10, sweep=sweep, solder_closest=closest,
-               pcb_final=d.mocap_pos[pcb_mocap].copy(), controller=controller,
-               schedule=schedule, model_error=model_error, gains=gains,
-               ur3_T=refs["UR3"].T, ur10_T=refs["UR10E"].T)
+    out.update(controller=controller, gains=gains, model_error=model_error, push=push,
+               human=human, start10=start10, cycle=end_t, solder_closest=closest,
+               pcb_final=d.mocap_pos[pcb].copy(), pcb_quat=d.mocap_quat[pcb].copy(),
+               plan3=plan3, plan10=plan10,
+               w_peak=(r3.w_peak, r10.w_peak), w_min=(r3.w_min, r10.w_min))
     if not quiet:
         summarise(out)
     return out
 
 
 def summarise(o):
-    t = o["t"]
     e3 = 1000 * np.linalg.norm(o["tcp"][:, :3] - o["tcp_ref"][:, :3], axis=1)
     e10 = 1000 * np.linalg.norm(o["tcp"][:, 3:] - o["tcp_ref"][:, 3:], axis=1)
-    pcb_target = yxz_mm_to_world_m(CELL["Pos4"]) + [0, 0, CELL["holder"]["Z"] / 1000]
-    cycle = max(o["ur3_T"], o["start10"] + o["ur10_T"])
-    print(f"controller={o['controller']}  gains={o['gains']}  schedule={o['schedule']}  "
-          f"model_error={o['model_error']:+.0%}")
-    print(f"  cycle time {cycle:.2f} s (UR10e starts at {o['start10']:.2f} s)")
-    print(f"  TCP error  UR3  : mean {e3.mean():6.2f} mm  max {e3.max():7.2f} mm")
-    print(f"  TCP error  UR10e: mean {e10.mean():6.2f} mm  max {e10.max():7.2f} mm")
-    print(f"  min robot-robot clearance {1000 * o['clear'].min():.0f} mm "
-          f"at t = {t[o['clear'].argmin()]:.2f} s")
-    print(f"  PCB placed {1000 * np.linalg.norm(o['pcb_final'] - pcb_target):.1f} mm "
-          f"from the Pos4 holder centre")
-    hits = [f"P{i + 1} {1000 * c:.2f} mm" + ("" if c < SOLDER_TOL else " (MISSED)")
+    w = o["w"] / np.array(o["w_peak"])
+    print(f"controller={o['controller']} gains={o['gains']} model_error={o['model_error']:+.0%} "
+          f"push={o['push']} human={o['human']}")
+    if o["cycle"] is not None:
+        print(f"  cycle {o['cycle']:.1f} s (UR10e starts {o['start10']:.1f} s)")
+    print(f"  tool error UR3   mean {e3.mean():6.2f} mm  max {e3.max():7.2f} mm")
+    print(f"  tool error UR10e mean {e10.mean():6.2f} mm  max {e10.max():7.2f} mm")
+    print(f"  min manipulability / peak: UR3 {np.nanmin(w[:, 0]):.2f}  UR10e {np.nanmin(w[:, 1]):.2f}")
+    print(f"  min UR3-UR10e clearance {1000 * np.nanmin(o['clear']):.0f} mm")
+    if np.isfinite(o["hand_d"]).any():
+        hold = (o["s10"] < 0.01).sum() * (o["t"][1] - o["t"][0])
+        print(f"  operator hand: closest {1000 * np.nanmin(o['hand_d']):.0f} mm, "
+              f"UR10e stopped for {hold:.1f} s")
+    hits = [f"pad {i + 1} {1000 * c:.2f} mm" + ("" if c < SOLDER_TOL else " MISSED")
             for i, c in enumerate(o["solder_closest"])]
     print("  closest hot-tip approach: " + ", ".join(hits))
 
@@ -286,23 +309,15 @@ def summarise(o):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--controller", choices=["ct", "pid"], default="ct")
-    ap.add_argument("--schedule", choices=["sequential", "overlap"], default="sequential")
-    ap.add_argument("--no-disturb", action="store_true")
+    ap.add_argument("--gains", choices=list(GAINS), default="tuned")
     ap.add_argument("--model-error", type=float, default=0.0)
-    ap.add_argument("--gains", choices=list(GAINS), default="matlab")
+    ap.add_argument("--no-push", action="store_true")
+    ap.add_argument("--no-human", action="store_true")
+    ap.add_argument("--speed", type=float, default=1.0, help="scale all segment speeds")
     ap.add_argument("--view", action="store_true")
-    ap.add_argument("--save", default=None, help="save the log as .npz")
     a = ap.parse_args()
-    if a.view:
-        import mujoco.viewer  # noqa: F401
-    o = run(a.controller, a.schedule, not a.no_disturb, a.model_error, a.view,
-            gains=a.gains)
-    if a.save:
-        np.savez(a.save, **{k: v for k, v in o.items() if isinstance(v, np.ndarray)})
+    run(a.controller, a.gains, a.model_error, not a.no_push, not a.no_human, a.speed, a.view)
 
 
 if __name__ == "__main__":
-    if not os.path.exists(XML):
-        from build_scene import write
-        write()
     main()
