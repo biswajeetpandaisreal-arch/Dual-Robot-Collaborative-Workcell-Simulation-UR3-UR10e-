@@ -139,12 +139,13 @@ def _workcell_spec():
         pcb.add_site(name=f"solder{i + 1}", pos=[u * MM, v * MM, pt / 2], size=[0.0015, 0, 0],
                      rgba=[1, 0.8, 0, 0])
 
-    # operator's hand + forearm (mocap), parked off the bench until used
+    # operator's hand + forearm (mocap), parked off the bench until used.
+    # Fingers point along +x; the forearm trails behind along -x.
     hand = w.add_body(name="hand", mocap=True, pos=[3.0, 3.0, -3.0])
     hand.add_geom(name="hand", type=mujoco.mjtGeom.mjGEOM_BOX, size=[0.045, 0.02, 0.012],
                   rgba=[0.87, 0.67, 0.55, 1], contype=0, conaffinity=0)
     hand.add_geom(name="forearm", type=mujoco.mjtGeom.mjGEOM_CAPSULE,
-                  fromto=[0.04, 0, 0, 0.32, 0, 0.05], size=[0.035, 0, 0],
+                  fromto=[-0.05, 0, 0.005, -0.32, 0, 0.03], size=[0.035, 0, 0],
                   rgba=[0.25, 0.35, 0.55, 1], contype=0, conaffinity=0)
     return s
 

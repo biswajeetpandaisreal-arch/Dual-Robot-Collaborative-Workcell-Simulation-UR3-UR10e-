@@ -19,7 +19,7 @@ rigid-body dynamics to test Part C properly.
   2 of 4 pads are hit, and none under a 15 % model error.
 - **Induced errors are handled**: a 30 N / 100 N knock on each tool is rejected within
   0.7 s (back under 0.5 mm), and an operator's hand reaching round the shield **stops the UR10e for
-  4.3 s** (speed and separation monitoring) before it resumes and finishes.
+  4.8 s** (speed and separation monitoring) before it resumes and finishes.
 - **Singularities are avoided by design**: IK is locked to one solution branch, so
   manipulability never drops below 58 % (UR3) / 37 % (UR10e) of peak.
 - **Workspace analysis drives the grasp**: with the gripper pointing down the UR3
@@ -147,7 +147,8 @@ the integral term leaves a ~10 s tail after any disturbance. The tuned gains
 - **Unexpected collision:** a 50 ms knock on each tool — 30 N down on the UR3 while it
   carries the PCB, 100 N sideways on the UR10e between pads 2 and 3.
 - **Unexpected human movement:** an operator's hand reaches round the end of the
-  shield toward the PCB while the UR10e is soldering. **Speed and separation
+  shield toward the PCB while the UR10e is soldering, routed round the shield's end
+  (it never comes closer than 28 mm to the shield). **Speed and separation
   monitoring** (as in ISO/TS 15066) scales the UR10e's path speed down below 400 mm
   separation and stops it below 250 mm; the path clock resumes when the hand
   withdraws, so the task completes without re-planning.
@@ -162,11 +163,11 @@ Full cycle with both induced errors in every scenario.
 
 | scenario | UR3 mean tool error (mm) | UR10e mean tool error (mm) | PCB placement error (mm) | pads within 1 mm | UR10e stopped for operator (s) | cycle (s) |
 |---|---|---|---|---|---|---|
-| Coursework PID+FF law as raw torque | 93.86 | 932.29 | 85.7 | 0/4 (worst 838.41 mm) | 4.3 | 50.5 |
-| Computed torque, coursework gains | 1.10 | 3.28 | 1.9 | 2/4 (worst 3.71 mm) | 4.3 | 50.5 |
-| Computed torque, tuned gains | 0.08 | 0.23 | 0.0 | 4/4 (worst 0.00 mm) | 4.3 | 50.5 |
-| Computed torque, coursework gains, model +15 % | 9.55 | 9.78 | 17.2 | 0/4 (worst 4.13 mm) | 4.3 | 50.5 |
-| Computed torque, tuned gains, model +15 % | 0.12 | 0.25 | 0.0 | 4/4 (worst 0.00 mm) | 4.3 | 50.5 |
+| Coursework PID+FF law as raw torque | 93.84 | 932.18 | 85.7 | 0/4 (worst 838.80 mm) | 4.8 | 50.5 |
+| Computed torque, coursework gains | 1.10 | 3.28 | 1.9 | 2/4 (worst 3.71 mm) | 4.8 | 50.5 |
+| Computed torque, tuned gains | 0.08 | 0.23 | 0.0 | 4/4 (worst 0.00 mm) | 4.8 | 50.5 |
+| Computed torque, coursework gains, model +15 % | 9.55 | 9.77 | 17.2 | 0/4 (worst 4.13 mm) | 4.8 | 50.5 |
+| Computed torque, tuned gains, model +15 % | 0.12 | 0.25 | 0.0 | 4/4 (worst 0.00 mm) | 4.8 | 50.5 |
 
 ---
 

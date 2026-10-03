@@ -109,23 +109,52 @@ def _min_dist(m, d, ga, gb, cap=1.0):
     return min(mujoco.mj_geomDistance(m, d, a, b, cap, ft) for a in ga for b in gb)
 
 
-HAND_PTS = np.array([[1.30, 1.80, 0.32], [0.80, 1.70, 0.28], [0.50, 1.22, 0.22]])
+# The operator stands on the far side of the shield (X > 0.76 m), reaches
+# round its end (Y = 1.58 m) with ~10 cm clearance, then toward the PCB.
+HAND_PTS = np.array([[1.35, 1.45, 0.30], [0.97, 1.70, 0.28], [0.64, 1.71, 0.26],
+                     [0.50, 1.30, 0.22]])
 HAND_PARK = np.array([3.0, 3.0, -3.0])        # out of sight until needed
+FOREARM = 0.30                                # m: forearm trails this far along the path
+HAND_OUT, HAND_HOLD, HAND_BACK = 2.8, 2.5, 2.4   # s: reach in, hold, withdraw
+
+
+def _polyline(pts, n=400):
+    seg = np.linalg.norm(np.diff(pts, axis=0), axis=1)
+    s = np.r_[0, np.cumsum(seg)]
+    u = np.linspace(0, s[-1], n)
+    return u, np.column_stack([np.interp(u, s, pts[:, k]) for k in range(3)])
+
+
+_HAND_S, _HAND_XYZ = _polyline(HAND_PTS)
+
+
+def _along(s):
+    """Point at arc length s on the hand path (extended straight before its start)."""
+    if s < 0:
+        back = HAND_PTS[0] - HAND_PTS[1]
+        return HAND_PTS[0] + (-s) * back / np.linalg.norm(back)
+    return np.array([np.interp(s, _HAND_S, _HAND_XYZ[:, k]) for k in range(3)])
 
 
 def _hand_path(t, t0):
-    """Operator reaches round the end of the shield toward the PCB, holds,
-    and withdraws."""
-    legs = [(t0, t0 + 1.0, 0, 1), (t0 + 1.0, t0 + 2.2, 1, 2),
-            (t0 + 4.7, t0 + 5.9, 2, 1), (t0 + 5.9, t0 + 6.9, 1, 0)]
-    for a, b, i, j in legs:
-        if a <= t < b:
-            s = (t - a) / (b - a)
-            s = 10 * s**3 - 15 * s**4 + 6 * s**5
-            return HAND_PTS[i] + s * (HAND_PTS[j] - HAND_PTS[i])
-    if t0 + 2.2 <= t < t0 + 4.7:
-        return HAND_PTS[2]
-    return HAND_PARK
+    """Hand pose (pos, quat): reaches in along the path, holds, withdraws the
+    same way. The forearm points back along the path, so it bends round the
+    shield's end with the hand instead of cutting through the shield."""
+    L = _HAND_S[-1]
+    tau = t - t0
+    if tau < 0 or tau > HAND_OUT + HAND_HOLD + HAND_BACK:
+        return HAND_PARK, np.array([1.0, 0, 0, 0])
+    if tau < HAND_OUT:
+        x = tau / HAND_OUT
+    elif tau < HAND_OUT + HAND_HOLD:
+        x = 1.0
+    else:
+        x = 1.0 - (tau - HAND_OUT - HAND_HOLD) / HAND_BACK
+    s = L * (10 * x**3 - 15 * x**4 + 6 * x**5)
+    p = _along(s)
+    behind = _along(s - FOREARM) - p
+    yaw = np.arctan2(-behind[1], -behind[0])       # +x (fingers) points away from the arm
+    return p, np.array([np.cos(yaw / 2), 0, 0, np.sin(yaw / 2)])
 
 
 def _seg_time(plan, label, frac):
@@ -183,7 +212,7 @@ def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
             plan10 = plan_ur10e(m, d.mocap_pos[pcb].copy(), d.mocap_quat[pcb].copy(), speed)
             ref10 = Reference(plan10)
             push10_t = _seg_time(plan10, "to pad 3", 0.5)
-            human_t0 = start10 + _seg_time(plan10, "solder pad 2", 0.2) - 2.2
+            human_t0 = start10 + _seg_time(plan10, "solder pad 2", 0.2) - HAND_OUT
         if ref10 is None:
             q_ref[6:], tool10_cmd, lab10 = HOME_UR, 0.0, "wait"
         else:
@@ -192,7 +221,7 @@ def run(controller="ct", gains="tuned", model_error=0.0, push=True, human=True,
 
         # ── operator's hand + speed and separation monitoring (every 10 ms) ──
         if human and human_t0 is not None:
-            d.mocap_pos[hand] = _hand_path(t, human_t0)
+            d.mocap_pos[hand], d.mocap_quat[hand] = _hand_path(t, human_t0)
             if t >= human_t0 and k % 10 == 0:
                 mujoco.mj_kinematics(m, d)
                 hand_d = _min_dist(m, d, g_hand, g10)
