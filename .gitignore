@@ -5,3 +5,9 @@
 # OS clutter
 .DS_Store
 Thumbs.db
+
+# Python
+__pycache__/
+*.pyc
+*.npz
+mujoco_sim/results_table.md

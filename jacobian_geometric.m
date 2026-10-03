@@ -3,14 +3,17 @@ function J = jacobian_geometric(q, rob)
 
 [~, ~, frames] = fk_dh(q, rob);
 
-% Origins and z-axes in DH-local
-% (frames{i} = frame after joint (i-1)'s transform, so frames{1..6}
-%  give the o_i/z_i needed for Jacobian columns 1..6)
+% Origins and z-axes in DH-local.
+% fk_dh uses the MODIFIED (Craig) DH convention, where joint i rotates about
+% z_i of frame i. frames{1} is the base and frames{i+1} is frame i, so
+% column i uses frames{i+1}. (Using frames{i} - frame i-1 - is the
+% standard-DH rule and gives wrong columns; verified against a numerical
+% finite-difference Jacobian.)
 o = zeros(3,7);
 z = zeros(3,6);
 
 for i=1:6
-    Ti = frames{i};
+    Ti = frames{i+1};
     o(:,i) = Ti(1:3,4);
     z(:,i) = Ti(1:3,3);
 end

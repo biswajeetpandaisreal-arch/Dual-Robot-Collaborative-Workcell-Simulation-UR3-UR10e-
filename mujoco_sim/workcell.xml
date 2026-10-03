@@ -1,0 +1,132 @@
+<mujoco model="ur3_ur10e_workcell">
+  <compiler angle="radian" autolimits="true"/>
+  <option timestep="0.001" integrator="implicitfast"/>
+  <visual>
+    <global offwidth="1600" offheight="900" azimuth="225" elevation="-25"/>
+    <quality shadowsize="4096"/>
+    <headlight ambient="0.35 0.35 0.35" diffuse="0.55 0.55 0.55"/>
+  </visual>
+  <asset>
+    <texture name="sky" type="skybox" builtin="gradient" rgb1="0.93 0.94 0.96"
+             rgb2="0.70 0.74 0.80" width="512" height="512"/>
+    <texture name="floor" type="2d" builtin="checker" rgb1="0.82 0.83 0.85"
+             rgb2="0.76 0.77 0.79" width="512" height="512"/>
+    <material name="floor" texture="floor" texrepeat="8 8"/>
+  </asset>
+  <default>
+    <!-- Robot links never collide physically: the simplified wrist shapes
+         overlap, and robot-robot clearance is computed geometrically
+         (simulate.py) rather than by contact. -->
+    <geom contype="0" conaffinity="0"/>
+  </default>
+  <worldbody>
+    <light pos="1 0.6 3" dir="0 0 -1" diffuse="0.6 0.6 0.6" castshadow="true"/>
+    <geom name="floor" type="plane" size="4 4 0.1" pos="0 0 -0.76" material="floor"/>
+    <camera name="overview" pos="3.10 -1.35 1.55" xyaxes="0.55 0.83 0 -0.33 0.22 0.92"/>
+    <camera name="overhead" pos="0.625 0.9725 1.87" xyaxes="0 -1 0 1 0 0"/>
+    <geom name="bench" type="box" size="0.625 0.9725 0.02" pos="0.625 0.9725 -0.02" rgba="0.72 0.58 0.42 1"/>
+    <geom type="box" size="0.03 0.03 0.36" pos="0.05 0.05 -0.40" rgba="0.35 0.35 0.37 1"/>
+    <geom type="box" size="0.03 0.03 0.36" pos="0.05 1.895 -0.40" rgba="0.35 0.35 0.37 1"/>
+    <geom type="box" size="0.03 0.03 0.36" pos="1.2 0.05 -0.40" rgba="0.35 0.35 0.37 1"/>
+    <geom type="box" size="0.03 0.03 0.36" pos="1.2 1.895 -0.40" rgba="0.35 0.35 0.37 1"/>
+    <geom name="holder_pos3" type="box" size="0.045 0.075 0.005" pos="0.945 0.505 0.14" rgba="0.60 0.60 0.62 1" contype="0" conaffinity="0"/>
+    <geom type="cylinder" size="0.012 0.0675" pos="0.945 0.505 0.0675" rgba="0.45 0.45 0.47 1" contype="0" conaffinity="0"/>
+    <geom name="holder_pos4" type="box" size="0.075 0.045 0.005" pos="0.405 1.055 0.14" rgba="0.60 0.60 0.62 1" contype="0" conaffinity="0"/>
+    <geom type="cylinder" size="0.012 0.0675" pos="0.405 1.055 0.0675" rgba="0.45 0.45 0.47 1" contype="0" conaffinity="0"/>
+    <site name="solder1" pos="0.368043 1.016237 0.14500000000000002" size="0.005" rgba="1 0.8 0 1"/>
+    <site name="solder2" pos="0.368043 1.002775 0.14500000000000002" size="0.005" rgba="1 0.8 0 1"/>
+    <site name="solder3" pos="0.39598300000000003 1.002775 0.14500000000000002" size="0.005" rgba="1 0.8 0 1"/>
+    <site name="solder4" pos="0.419097 1.002775 0.14500000000000002" size="0.005" rgba="1 0.8 0 1"/>
+    <geom name="screen" type="box" size="0.02 0.35 0.25" pos="0.945 1.25 0.25" rgba="1 0.9 0 0.25" contype="0" conaffinity="0"/>
+    <geom type="box" size="0.06 0.06 0.06" pos="0.625 0.9725 1.95" rgba="0.95 0.95 0.95 1" contype="0" conaffinity="0"/>
+    <body name="pcb" mocap="true" pos="0.945 0.505 0.15000000000000002">
+      <geom name="pcb" type="box" size="0.042545 0.028067 0.0025"
+            rgba="0.15 0.60 0.20 1" contype="0" conaffinity="0"/>
+    </body>
+    <body name="ur3_base" pos="0.4 0.37 0">
+      <geom type="cylinder" size="0.0562 0.012" pos="0 0 0.012" rgba="0.20 0.34 0.56 1" contype="0" conaffinity="0" mass="1"/>
+      <body name="ur3_link1" pos="0 -0 0.152" quat="1 0 0 0">
+        <joint name="ur3_j1" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="0.5" armature="0.05"/>
+        <geom name="ur3_housing1" type="cylinder" size="0.0450 0.0250" rgba="0.20 0.34 0.56 1" mass="2.0000" group="1"/>
+        <body name="ur3_link2" pos="0 -0 0" quat="0.5 0.5 -0.5 0.5">
+          <joint name="ur3_j2" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="0.5" armature="0.05"/>
+          <geom name="ur3_housing2" type="cylinder" size="0.0450 0.0250" rgba="0.20 0.34 0.56 1" mass="1.3680" group="1"/>
+          <geom name="ur3_link2" type="capsule" fromto="0 0 0 0.244 -0 0" size="0.0320" rgba="0.86 0.87 0.89 1" mass="2.0520" group="1"/>
+          <body name="ur3_link3" pos="0.244 -0 0" quat="1 0 0 0">
+            <joint name="ur3_j3" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="0.5" armature="0.05"/>
+            <geom name="ur3_housing3" type="cylinder" size="0.0450 0.0250" rgba="0.20 0.34 0.56 1" mass="0.5040" group="1"/>
+            <geom name="ur3_link3" type="capsule" fromto="0 0 0 0.213 -0 0.112" size="0.0320" rgba="0.86 0.87 0.89 1" mass="0.7560" group="1"/>
+            <body name="ur3_link4" pos="0.213 -0 0.112" quat="0.707107 0 0 -0.707107">
+              <joint name="ur3_j4" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="0.5" armature="0.05"/>
+              <geom name="ur3_housing4" type="cylinder" size="0.0450 0.0250" rgba="0.20 0.34 0.56 1" mass="0.3200" group="1"/>
+              <geom name="ur3_link4" type="capsule" fromto="0 0 0 0 0.085 5.20475e-18" size="0.0320" rgba="0.86 0.87 0.89 1" mass="0.4800" group="1"/>
+              <body name="ur3_link5" pos="0 0.085 5.20475e-18" quat="0.707107 -0.707107 0 0">
+                <joint name="ur3_j5" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="0.5" armature="0.05"/>
+                <geom name="ur3_housing5" type="cylinder" size="0.0450 0.0250" rgba="0.20 0.34 0.56 1" mass="0.3200" group="1"/>
+                <geom name="ur3_link5" type="capsule" fromto="0 0 0 0 -0.234 1.43284e-17" size="0.0320" rgba="0.86 0.87 0.89 1" mass="0.4800" group="1"/>
+                <body name="ur3_link6" pos="0 -0.234 1.43284e-17" quat="0.707107 0.707107 0 0">
+                  <joint name="ur3_j6" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="0.5" armature="0.05"/>
+                  <geom name="ur3_housing6" type="cylinder" size="0.0450 0.0250" rgba="0.20 0.34 0.56 1" mass="0.1400" group="1"/>
+                  <geom name="ur3_flange" type="capsule" fromto="0 0 -0.2340 0 0 -0.1521" size="0.0288" rgba="0.86 0.87 0.89 1" mass="0.2100" group="1"/>
+                  <geom name="ur3_tool" type="cylinder" fromto="0 0 -0.1521 0 0 -0.030" size="0.022" rgba="0.10 0.70 0.70 1" mass="0.3" group="1"/>
+                  <geom name="ur3_finger_a" type="box" size="0.006 0.012 0.022" pos="0.018 0 -0.012" rgba="0.25 0.25 0.27 1" mass="0.02" group="1"/>
+                  <geom name="ur3_finger_b" type="box" size="0.006 0.012 0.022" pos="-0.018 0 -0.012" rgba="0.25 0.25 0.27 1" mass="0.02" group="1"/>
+                  <site name="ur3_tcp" pos="0 0 0" size="0.006" rgba="1 0 0 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+    <body name="ur10e_base" pos="0.2 1.695 0">
+      <geom type="cylinder" size="0.0938 0.012" pos="0 0 0.012" rgba="0.20 0.34 0.56 1" contype="0" conaffinity="0" mass="1"/>
+      <body name="ur10e_link1" pos="0 -0 0.18" quat="1 0 0 0">
+        <joint name="ur10e_j1" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="2.0" armature="0.3"/>
+        <geom name="ur10e_housing1" type="cylinder" size="0.0750 0.0425" rgba="0.20 0.34 0.56 1" mass="7.3690" group="1"/>
+        <body name="ur10e_link2" pos="0 -0 0" quat="0.5 0.5 -0.5 0.5">
+          <joint name="ur10e_j2" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="2.0" armature="0.3"/>
+          <geom name="ur10e_housing2" type="cylinder" size="0.0750 0.0425" rgba="0.20 0.34 0.56 1" mass="5.2204" group="1"/>
+          <geom name="ur10e_link2" type="capsule" fromto="0 0 0 0.6127 -0 0" size="0.0550" rgba="0.86 0.87 0.89 1" mass="7.8306" group="1"/>
+          <body name="ur10e_link3" pos="0.6127 -0 0" quat="1 0 0 0">
+            <joint name="ur10e_j3" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="2.0" armature="0.3"/>
+            <geom name="ur10e_housing3" type="cylinder" size="0.0750 0.0425" rgba="0.20 0.34 0.56 1" mass="1.5956" group="1"/>
+            <geom name="ur10e_link3" type="capsule" fromto="0 0 0 0.5716 -0 0.1741" size="0.0550" rgba="0.86 0.87 0.89 1" mass="2.3934" group="1"/>
+            <body name="ur10e_link4" pos="0.5716 -0 0.1741" quat="0.707107 0 0 -0.707107">
+              <joint name="ur10e_j4" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="2.0" armature="0.3"/>
+              <geom name="ur10e_housing4" type="cylinder" size="0.0750 0.0425" rgba="0.20 0.34 0.56 1" mass="0.8400" group="1"/>
+              <geom name="ur10e_link4" type="capsule" fromto="0 0 0 0 0.1198 7.33563e-18" size="0.0550" rgba="0.86 0.87 0.89 1" mass="1.2600" group="1"/>
+              <body name="ur10e_link5" pos="0 0.1198 7.33563e-18" quat="0.707107 -0.707107 0 0">
+                <joint name="ur10e_j5" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="2.0" armature="0.3"/>
+                <geom name="ur10e_housing5" type="cylinder" size="0.0750 0.0425" rgba="0.20 0.34 0.56 1" mass="0.7920" group="1"/>
+                <geom name="ur10e_link5" type="capsule" fromto="0 0 0 0 -0.3965 2.42786e-17" size="0.0550" rgba="0.86 0.87 0.89 1" mass="1.1880" group="1"/>
+                <body name="ur10e_link6" pos="0 -0.3965 2.42786e-17" quat="0.707107 0.707107 0 0">
+                  <joint name="ur10e_j6" type="hinge" axis="0 0 1" range="-6.2832 6.2832" damping="2.0" armature="0.3"/>
+                  <geom name="ur10e_housing6" type="cylinder" size="0.0750 0.0425" rgba="0.20 0.34 0.56 1" mass="0.2460" group="1"/>
+                  <geom name="ur10e_flange" type="capsule" fromto="0 0 -0.3965 0 0 -0.2800" size="0.0495" rgba="0.86 0.87 0.89 1" mass="0.3690" group="1"/>
+                  <geom name="ur10e_tool" type="cylinder" fromto="0 0 -0.2800 0 0 -0.060" size="0.020" rgba="1.00 0.60 0.10 1" mass="0.4" group="1"/>
+                  <geom name="ur10e_tip" type="capsule" fromto="0 0 -0.060 0 0 0" size="0.004" rgba="0.75 0.75 0.78 1" mass="0.02" group="1"/>
+                  <site name="ur10e_tcp" pos="0 0 0" size="0.006" rgba="1 0 0 0"/>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+  <actuator>
+    <motor name="ur3_m1" joint="ur3_j1" gear="1" ctrlrange="-56 56" ctrllimited="true"/>
+    <motor name="ur3_m2" joint="ur3_j2" gear="1" ctrlrange="-56 56" ctrllimited="true"/>
+    <motor name="ur3_m3" joint="ur3_j3" gear="1" ctrlrange="-28 28" ctrllimited="true"/>
+    <motor name="ur3_m4" joint="ur3_j4" gear="1" ctrlrange="-12 12" ctrllimited="true"/>
+    <motor name="ur3_m5" joint="ur3_j5" gear="1" ctrlrange="-12 12" ctrllimited="true"/>
+    <motor name="ur3_m6" joint="ur3_j6" gear="1" ctrlrange="-12 12" ctrllimited="true"/>
+    <motor name="ur10e_m1" joint="ur10e_j1" gear="1" ctrlrange="-330 330" ctrllimited="true"/>
+    <motor name="ur10e_m2" joint="ur10e_j2" gear="1" ctrlrange="-330 330" ctrllimited="true"/>
+    <motor name="ur10e_m3" joint="ur10e_j3" gear="1" ctrlrange="-150 150" ctrllimited="true"/>
+    <motor name="ur10e_m4" joint="ur10e_j4" gear="1" ctrlrange="-56 56" ctrllimited="true"/>
+    <motor name="ur10e_m5" joint="ur10e_j5" gear="1" ctrlrange="-56 56" ctrllimited="true"/>
+    <motor name="ur10e_m6" joint="ur10e_j6" gear="1" ctrlrange="-56 56" ctrllimited="true"/>
+  </actuator>
+</mujoco>
