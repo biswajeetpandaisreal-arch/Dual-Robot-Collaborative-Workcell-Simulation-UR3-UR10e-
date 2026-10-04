@@ -48,6 +48,7 @@ plot_trajectories(t3, tr3, t10, tr10, cfg.files.fig_traj);
 
 %% 3) Control simulations (PID + FF)
 fprintf('[3] PID+FF control (normal + disturbed)...\n');
+rng(0);   % the disturbance uses randn: fix the seed so runs are reproducible
 
 d_none = struct('enable',false,'t0',0,'mag',0);
 d_ur3  = struct('enable',true,'t0',2.5,'mag',0.10);
